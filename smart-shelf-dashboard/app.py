@@ -141,29 +141,36 @@ def send_smtp_email(to_addr: str, subject: str, body: str) -> tuple[bool, str]:
 
 
 def trigger_low_stock_alert(item: str, count: int, threshold: int) -> int:
-    """
-    Send role-tailored emails to all enabled non-technician recipients.
-    Honors the cooldown window. Returns the number of emails sent.
-    """
     config = get_config()
     if not config.get("enabled", True):
         return 0
 
-    # Cooldown check
+    # Cooldown check — skip entirely if cooldown is 0
     cooldown_min = int(config.get("cooldown_minutes", 15))
-    with _cooldown_lock:
-        last_sent = _alert_cooldowns.get(item)
-        if last_sent and datetime.now() - last_sent < timedelta(minutes=cooldown_min):
-            return 0
-        _alert_cooldowns[item] = datetime.now()
+    if cooldown_min > 0:
+        with _cooldown_lock:
+            last_sent = _alert_cooldowns.get(item)
+            if last_sent and datetime.now() - last_sent < timedelta(minutes=cooldown_min):
+                print(f"[COOLDOWN] {item} suppressed — last sent {datetime.now() - last_sent} ago")
+                return 0
+            _alert_cooldowns[item] = datetime.now()
+    else:
+        print(f"[COOLDOWN] Cooldown is 0 — skipping cooldown check for {item}")
 
     recipients = get_recipients()
-    targets = [r for r in recipients if r["enabled"] and r["role"] != "technician"]
+    print(f"[DEBUG] Total recipients in DB: {len(recipients)}")
+    for r in recipients:
+        print(f"[DEBUG]   {r['name']} | enabled={r['enabled']} | role={r['role']}")
+
+    targets = [r for r in recipients if r["enabled"]]
+    print(f"[DEBUG] Targets after filter: {len(targets)}")
 
     sent_count = 0
     for r in targets:
+        print(f"[DEBUG] Sending to {r['name']} <{r['email']}>...")
         email = build_email_for_recipient(r, item, count, threshold)
         ok, status = send_smtp_email(r["email"], email["subject"], email["body"])
+        print(f"[DEBUG]   Result: ok={ok} status={status}")
         log_email(
             recipient_id=r["id"],
             recipient_name=r["name"],
@@ -244,6 +251,7 @@ def list_inventory():
     return jsonify(get_inventory())
 
 
+
 @app.route("/api/inventory/<item>", methods=["PUT"])
 def update_inventory(item):
     """Manually adjust inventory (for the UI's +/- buttons during demo)."""
@@ -253,14 +261,24 @@ def update_inventory(item):
         if not prev:
             return jsonify({"error": "item not found"}), 404
         new_count = int(data["count"])
+        old_count = prev["count"]
+        threshold = prev["threshold"]
+
+        print(f"\n[INVENTORY] {item}: {old_count} -> {new_count}  (threshold={threshold})")
         set_inventory_count(item, new_count)
-        # Fire alert if threshold crossed
-        if new_count < prev["threshold"] and prev["count"] >= prev["threshold"]:
-            trigger_low_stock_alert(item, new_count, prev["threshold"])
+
+        if new_count < threshold and old_count >= threshold:
+            print(f"[ALERT] {item} crossed below threshold! Sending emails...")
+            sent = trigger_low_stock_alert(item, new_count, threshold)
+            print(f"[ALERT] {sent} email(s) sent for {item}")
+        else:
+            print(f"[NO ALERT] new={new_count} old={old_count} threshold={threshold} - no crossing")
+
     if "threshold" in data:
         from db import set_inventory_threshold
         set_inventory_threshold(item, int(data["threshold"]))
     return jsonify({"ok": True, "item": item})
+
 
 
 @app.route("/api/scans", methods=["GET"])
